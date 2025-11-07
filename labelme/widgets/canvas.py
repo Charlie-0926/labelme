@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import enum
 import functools
+import os
+from pathlib import Path
 from typing import Literal
 
 import imgviz
@@ -66,6 +68,8 @@ class Canvas(QtWidgets.QWidget):
 
     _ai_model_name: str = "sam2:latest"
     _ai_model_cache: osam.types.Model | None = None
+    _ai_model_directory: Path | None = None
+    _prompt_for_missing_model: bool = True
 
     _cursor: QtCore.Qt.CursorShape
 
@@ -129,6 +133,8 @@ class Canvas(QtWidgets.QWidget):
         # Set widget options.
         self.setMouseTracking(True)
         self.setFocusPolicy(Qt.WheelFocus)
+        self._ai_model_directory = None
+        self._prompt_for_missing_model = True
 
     def fillDrawing(self):
         return self._fill_drawing
@@ -159,9 +165,23 @@ class Canvas(QtWidgets.QWidget):
         logger.debug("Setting AI model to {!r}", model_name)
         self._ai_model_name = model_name
 
+    def set_ai_model_preferences(
+        self,
+        directory: str | Path | None,
+        prompt_for_missing_model: bool,
+    ) -> None:
+        self._ai_model_directory = (
+            Path(directory).expanduser() if directory is not None else None
+        )
+        self._prompt_for_missing_model = prompt_for_missing_model
+
     def _get_ai_model(self) -> osam.types.Model:
         if self._ai_model_cache and self._ai_model_cache.name == self._ai_model_name:
             return self._ai_model_cache
+
+        if self._ai_model_directory is not None:
+            os.environ.setdefault("OSAM_CACHE_DIR", str(self._ai_model_directory))
+            os.environ.setdefault("OSAM_MODEL_DIR", str(self._ai_model_directory))
 
         model_type = osam.apis.get_model_type_by_name(self._ai_model_name)
 
@@ -516,7 +536,12 @@ class Canvas(QtWidgets.QWidget):
                 elif not self.outOfPixmap(pos):
                     if self.createMode in ["ai_polygon", "ai_mask"]:
                         if not download_ai_model(
-                            model_name=self._ai_model_name, parent=self
+                            model_name=self._ai_model_name,
+                            parent=self,
+                            local_model_dir=str(self._ai_model_directory)
+                            if self._ai_model_directory is not None
+                            else None,
+                            prompt_when_missing=self._prompt_for_missing_model,
                         ):
                             return
 

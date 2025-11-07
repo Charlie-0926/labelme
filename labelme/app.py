@@ -5,6 +5,7 @@ import html
 import math
 import os
 import os.path as osp
+from pathlib import Path
 import re
 import types
 import webbrowser
@@ -23,6 +24,7 @@ from PyQt5.QtWidgets import QMessageBox
 
 from labelme import __appname__
 from labelme import __version__
+from labelme import exporters
 from labelme._automation import bbox_from_text
 from labelme._label_file import LabelFile
 from labelme._label_file import LabelFileError
@@ -55,6 +57,49 @@ from . import utils
 LABEL_COLORMAP: NDArray[np.uint8] = imgviz.label_colormap()
 
 
+class _ExportFormatDialog(QtWidgets.QDialog):
+    _FORMAT_CHOICES: tuple[tuple[str, str], ...] = (
+        ("json", "LabelMe JSON (*.json)"),
+        ("yolo", "YOLO txt (*.txt)"),
+        ("unet", "U-NET masks (*.png)"),
+    )
+
+    def __init__(self, parent: QtWidgets.QWidget, selected: set[str]):
+        super().__init__(parent)
+        self.setWindowTitle(self.tr("Select export formats"))
+        self.setModal(True)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        self._checkboxes: dict[str, QtWidgets.QCheckBox] = {}
+        for key, label in self._FORMAT_CHOICES:
+            checkbox = QtWidgets.QCheckBox(label, self)
+            checkbox.setChecked(key in selected)
+            checkbox.stateChanged.connect(self._update_ok_state)
+            layout.addWidget(checkbox)
+            self._checkboxes[key] = checkbox
+
+        self._button_box = QtWidgets.QDialogButtonBox(
+            QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel,
+            parent=self,
+        )
+        self._button_box.accepted.connect(self.accept)
+        self._button_box.rejected.connect(self.reject)
+        layout.addWidget(self._button_box)
+
+        self._update_ok_state()
+
+    def selected_formats(self) -> list[str]:
+        return [
+            key for key, checkbox in self._checkboxes.items() if checkbox.isChecked()
+        ]
+
+    def _update_ok_state(self) -> None:
+        has_selection = any(checkbox.isChecked() for checkbox in self._checkboxes.values())
+        ok_button = self._button_box.button(QtWidgets.QDialogButtonBox.Ok)
+        if ok_button is not None:
+            ok_button.setEnabled(has_selection)
+
+
 class MainWindow(QtWidgets.QMainWindow):
     FIT_WINDOW, FIT_WIDTH, MANUAL_ZOOM = 0, 1, 2
 
@@ -80,6 +125,23 @@ class MainWindow(QtWidgets.QMainWindow):
         if config is None:
             config = get_config()
         self._config = config
+
+        ai_config = self._config.setdefault("ai", {})
+        self._ai_model_dir: str | None = ai_config.get("model_dir")
+        self._prompt_missing_model: bool = bool(
+            ai_config.get("prompt_for_missing_model", True)
+        )
+
+        export_config = self._config.setdefault("export", {})
+        default_formats = export_config.get("formats") or ["json"]
+        self._export_formats: set[str] = {
+            fmt.lower() for fmt in default_formats if fmt
+        }
+        if not self._export_formats:
+            self._export_formats = {"json"}
+        self._export_prompt_on_save: bool = bool(
+            export_config.get("prompt_on_save", False)
+        )
 
         # set default shape colors
         Shape.line_color = QtGui.QColor(*self._config["shape"]["line_color"])
@@ -178,6 +240,10 @@ class MainWindow(QtWidgets.QMainWindow):
             double_click=self._config["canvas"]["double_click"],
             num_backups=self._config["canvas"]["num_backups"],
             crosshair=self._config["canvas"]["crosshair"],
+        )
+        self.canvas.set_ai_model_preferences(
+            directory=self._ai_model_dir,
+            prompt_for_missing_model=self._prompt_missing_model,
         )
         self.canvas.zoomRequest.connect(self.zoomRequest)
         self.canvas.mouseMoved.connect(self._update_status_stats)
@@ -288,6 +354,21 @@ class MainWindow(QtWidgets.QMainWindow):
             shortcut=shortcuts["save_to"],
             icon="open",
             tip=self.tr("Change where annotations are loaded/saved"),
+        )
+
+        configureExportFormats = action(
+            self.tr("Export &Formats..."),
+            slot=self._open_export_format_dialog,
+            shortcut=None,
+            icon=None,
+            tip=self.tr("Select additional export formats"),
+        )
+        setAiModelDir = action(
+            self.tr("Set &AI Model Directory..."),
+            slot=self._select_ai_model_directory,
+            shortcut=None,
+            icon="open",
+            tip=self.tr("Choose a directory that stores AI models"),
         )
 
         saveAuto = action(
@@ -632,6 +713,8 @@ class MainWindow(QtWidgets.QMainWindow):
             saveAuto=saveAuto,
             saveWithImageData=saveWithImageData,
             changeOutputDir=changeOutputDir,
+            configureExportFormats=configureExportFormats,
+            setAiModelDirectory=setAiModelDir,
             save=save,
             saveAs=saveAs,
             open=open_,
@@ -768,6 +851,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 saveAs,
                 saveAuto,
                 changeOutputDir,
+                configureExportFormats,
+                setAiModelDir,
                 saveWithImageData,
                 close,
                 deleteFile,
@@ -1030,13 +1115,104 @@ class MainWindow(QtWidgets.QMainWindow):
     def show_status_message(self, message, delay=500):
         self.statusBar().showMessage(message, delay)
 
+    def _open_export_format_dialog(self) -> None:
+        dialog = _ExportFormatDialog(self, self._export_formats)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return
+        selected = dialog.selected_formats()
+        if not selected:
+            return
+        self._export_formats = {fmt.lower() for fmt in selected}
+        self._config.setdefault("export", {})["formats"] = sorted(
+            self._export_formats
+        )
+        self.statusBar().showMessage(self.tr("Export formats updated"), 2000)
+
+    def _select_ai_model_directory(self, _value=False):
+        default_dir = self._ai_model_dir
+        if default_dir is None:
+            default_dir = str(
+                Path(self._config.get("ai", {}).get("model_dir", "~")).expanduser()
+            )
+
+        directory = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            self.tr("Select AI Model Directory"),
+            default_dir,
+        )
+        directory = str(directory)
+        if not directory:
+            return
+
+        self._ai_model_dir = directory
+        self._config.setdefault("ai", {})["model_dir"] = directory
+        self.canvas.set_ai_model_preferences(
+            directory=directory,
+            prompt_for_missing_model=self._prompt_missing_model,
+        )
+        self.statusBar().showMessage(
+            self.tr("AI model directory set to {0}").format(directory), 2000
+        )
+
+    def _resolve_export_formats_for_save(self, prompt: bool) -> list[str] | None:
+        if not prompt:
+            return sorted(self._export_formats)
+
+        dialog = _ExportFormatDialog(self, self._export_formats)
+        if dialog.exec_() != QtWidgets.QDialog.Accepted:
+            return None
+
+        selected = dialog.selected_formats()
+        if not selected:
+            return None
+
+        self._export_formats = {fmt.lower() for fmt in selected}
+        self._config.setdefault("export", {})["formats"] = sorted(
+            self._export_formats
+        )
+        return sorted(self._export_formats)
+
+    def _export_additional_formats(
+        self, filename: str, shapes: list[dict], formats: list[str]
+    ) -> None:
+        normalized = {fmt.lower() for fmt in formats if fmt}
+        normalized.discard("json")
+        if not normalized:
+            return
+
+        image_arr = utils.img_qt_to_arr(self.image)
+        label_name_to_value: dict[str | None, int] = {"_background_": 0}
+        for shape in shapes:
+            label = shape.get("label")
+            if label not in label_name_to_value:
+                label_name_to_value[label] = len(label_name_to_value)
+
+        label_names: list[str | None] = [None] * (
+            max(label_name_to_value.values()) + 1
+        )
+        for name, value in label_name_to_value.items():
+            label_names[value] = name
+
+        exporters.export_formats(
+            base_path=filename,
+            image=image_arr,
+            shapes=shapes,
+            formats=normalized,
+            label_names=label_names,
+        )
+
     def _submit_ai_prompt(self, _) -> None:
         texts = self._ai_prompt_widget.get_text_prompt().split(",")
 
         model_name: str = "yoloworld"
         model_type = osam.apis.get_model_type_by_name(model_name)
         if not (_is_already_downloaded := model_type.get_size() is not None):
-            if not download_ai_model(model_name=model_name, parent=self):
+            if not download_ai_model(
+                model_name=model_name,
+                parent=self,
+                local_model_dir=self._ai_model_dir,
+                prompt_when_missing=self._prompt_missing_model,
+            ):
                 return
 
         boxes, scores, labels = bbox_from_text.get_bboxes_from_texts(
@@ -1438,19 +1614,49 @@ class MainWindow(QtWidgets.QMainWindow):
     def saveLabels(self, filename):
         lf = LabelFile()
 
+        prompt_for_export = self._export_prompt_on_save and not (
+            self._config.get("auto_save") or self.actions.saveAuto.isChecked()
+        )
+        export_formats = self._resolve_export_formats_for_save(
+            prompt=prompt_for_export
+        )
+        if export_formats is None:
+            return False
+
+        export_shapes: list[dict] = []
+
         def format_shape(s):
             data = s.other_data.copy()
+            points = [(p.x(), p.y()) for p in s.points]
+            flags = {} if s.flags is None else dict(s.flags)
+            mask_encoded = (
+                None
+                if s.mask is None
+                else utils.img_arr_to_b64(s.mask.astype(np.uint8))
+            )
             data.update(
                 dict(
                     label=s.label,
-                    points=[(p.x(), p.y()) for p in s.points],
+                    points=points,
                     group_id=s.group_id,
                     description=s.description,
                     shape_type=s.shape_type,
-                    flags=s.flags,
+                    flags=flags,
+                    mask=mask_encoded,
+                )
+            )
+            export_shapes.append(
+                dict(
+                    label=s.label,
+                    points=points,
+                    group_id=s.group_id,
+                    description=s.description,
+                    shape_type=s.shape_type,
+                    flags=flags.copy(),
                     mask=None
                     if s.mask is None
-                    else utils.img_arr_to_b64(s.mask.astype(np.uint8)),
+                    else np.array(s.mask, dtype=bool),
+                    other_data=s.other_data.copy(),
                 )
             )
             return data
@@ -1487,6 +1693,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 items[0].setCheckState(Qt.Checked)
             # disable allows next and previous image to proceed
             # self.filename = filename
+            try:
+                self._export_additional_formats(
+                    filename=filename,
+                    shapes=export_shapes,
+                    formats=export_formats,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to export additional formats for %s", filename
+                )
             return True
         except LabelFileError as e:
             self.errorMessage(

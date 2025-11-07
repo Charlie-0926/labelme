@@ -8,6 +8,7 @@ import numpy.typing as npt
 import PIL.Image
 from loguru import logger
 
+from labelme import exporters
 from labelme import utils
 from labelme._label_file import LabelFile
 
@@ -16,9 +17,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("json_file")
     parser.add_argument("-o", "--out", default=None)
+    parser.add_argument(
+        "--format",
+        dest="formats",
+        action="append",
+        choices=["json", "yolo", "unet"],
+        help="Export format(s) to generate. Repeat to select multiple formats.",
+    )
     args = parser.parse_args()
 
     json_file = args.json_file
+    formats = args.formats or ["json"]
 
     if args.out is None:
         out_dir = osp.splitext(osp.basename(json_file))[0]
@@ -57,6 +66,15 @@ def main():
     with open(osp.join(out_dir, "label_names.txt"), "w") as f:
         for lbl_name in label_names:
             f.write(f"{lbl_name}\n")
+
+    base_path = osp.join(out_dir, osp.basename(json_file))
+    exporters.export_formats(
+        base_path=base_path,
+        image=image,
+        shapes=label_file.shapes,
+        formats=formats,
+        label_names=label_names,
+    )
 
     logger.info(f"Saved to: {out_dir}")
 

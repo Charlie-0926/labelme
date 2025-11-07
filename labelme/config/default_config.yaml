@@ -31,6 +31,13 @@ shape:
 
 ai:
   default: 'Sam2 (balanced)'
+  model_dir: '~/.cache/labelme/models'
+  prompt_for_missing_model: true
+
+export:
+  formats:
+    - json
+  prompt_on_save: false
 
 # main
 flag_dock:

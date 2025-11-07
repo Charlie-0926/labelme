@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import os
 import types
+from pathlib import Path
 
 import osam
 from loguru import logger
@@ -11,6 +13,8 @@ from PyQt5.QtCore import Qt
 from PyQt5.QtCore import QThreadPool
 from PyQt5.QtCore import pyqtSignal
 from PyQt5.QtWidgets import QProgressDialog
+
+from labelme import exporters
 
 
 class _AiModelDownloadSignals(QObject):
@@ -32,7 +36,41 @@ class _AiModelDownloadWorker(QRunnable):
             self.signals.error.emit(e)
 
 
-def download_ai_model(model_name: str, parent: QtWidgets.QWidget) -> bool:
+def download_ai_model(
+    model_name: str,
+    parent: QtWidgets.QWidget,
+    *,
+    local_model_dir: str | None = None,
+    prompt_when_missing: bool = True,
+) -> bool:
+    local_dir: Path | None = None
+    if local_model_dir:
+        local_dir = Path(local_model_dir).expanduser()
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        model_keyword = model_name.split(":", 1)[0]
+        if exporters.contains_model_files(local_dir, model_keyword):
+            os.environ.setdefault("OSAM_CACHE_DIR", str(local_dir))
+            os.environ.setdefault("OSAM_MODEL_DIR", str(local_dir))
+            return True
+
+        if prompt_when_missing:
+            answer = QtWidgets.QMessageBox.question(
+                parent,
+                parent.tr("AI model not found"),
+                parent.tr(
+                    "No AI model files were detected in {0}.\n"
+                    "Do you want to download them now?"
+                ).format(str(local_dir)),
+                QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+                QtWidgets.QMessageBox.Yes,
+            )
+            if answer != QtWidgets.QMessageBox.Yes:
+                return False
+
+        os.environ.setdefault("OSAM_CACHE_DIR", str(local_dir))
+        os.environ.setdefault("OSAM_MODEL_DIR", str(local_dir))
+
     model_type = osam.apis.get_model_type_by_name(model_name)
 
     if _is_already_downloaded := model_type.get_size() is not None:
